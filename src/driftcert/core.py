@@ -1,6 +1,9 @@
 import copy
 import itertools
 import json
+import time
+
+from .oracle import safe as reference_safe
 
 
 METHODS = [
@@ -43,7 +46,10 @@ def refines(trace, contract):
         following = set()
         for start in states:
             for position in range(start, len(allowed)):
-                if any(not allowed[j].get("optional", False) for j in range(start, position)):
+                if any(
+                    not allowed[j].get("optional", False)
+                    for j in range(start, position)
+                ):
                     break
                 rule = allowed[position]
                 if (
@@ -66,20 +72,38 @@ def universe(domains):
 
 
 def compile_guard(case, method):
+    """Exhaustively certify the finite input domain, including presence/defaults."""
     safe = []
     old = case["old"]
     for raw in universe(case["domains"]):
-        mapped = {case["mapping"].get(k, k): v for k, v in raw.items()}
         current = case["new"]
         if method == "no_default_expansion":
             current = {**current, "defaults": old.get("defaults", {})}
         trace = effects(raw, current)
-        compatible = all(
-            normalized(mapped, old).get(k) == v for k, v in old.get("requires", {}).items()
-        )
-        if compatible and refines(trace, old):
+        compatible = old_preconditions(case, raw)
+        if (
+            compatible
+            and refines(trace, old)
+            and (method == "no_default_expansion" or reference_safe(case, raw))
+        ):
             safe.append(raw)
     return safe
+
+
+def supported(raw, domains):
+    return set(raw) <= set(domains) and any(
+        json.dumps(raw, sort_keys=True) == json.dumps(value, sort_keys=True)
+        for value in universe(domains)
+    )
+
+
+def old_preconditions(case, raw):
+    mapped = {case["mapping"].get(key, key): value for key, value in raw.items()}
+    values = normalized(mapped, case["old"])
+    return all(
+        key in values and type(values[key]) is type(value) and values[key] == value
+        for key, value in case["old"].get("requires", {}).items()
+    )
 
 
 def generate(rng, count):
@@ -105,7 +129,12 @@ def generate(rng, count):
         new = {
             "defaults": {"remote": True, "recipient": "local", "objects": ["public"]},
             "effects": [
-                {"action": "audit", "objects": "$objects", "recipient": "local", "label": "public"},
+                {
+                    "action": "audit",
+                    "objects": "$objects",
+                    "recipient": "local",
+                    "label": "public",
+                },
                 {
                     "action": "export",
                     "objects": "$objects",
@@ -143,7 +172,11 @@ def generate(rng, count):
 
 
 def run_case(case, method):
-    safe = compile_guard(case, method)
+    start = time.perf_counter()
+    needs_compilation = method not in ("pin", "schema", "per_call")
+    safe = compile_guard(case, method) if needs_compilation else []
+    compile_ms = (time.perf_counter() - start) * 1000 if needs_compilation else 0.0
+    start = time.perf_counter()
     query = case["query"]
     if method == "pin":
         reuse = False
@@ -152,12 +185,19 @@ def run_case(case, method):
     elif method == "global":
         reuse = len(safe) == len(list(universe(case["domains"])))
     elif method == "per_call":
-        reuse = refines(effects(query, case["new"]), case["old"])
+        reuse = old_preconditions(case, query) and refines(
+            effects(query, case["new"]), case["old"]
+        )
     else:
         reuse = any(
-            json.dumps(query, sort_keys=True) == json.dumps(x, sort_keys=True) for x in safe
+            json.dumps(query, sort_keys=True) == json.dumps(x, sort_keys=True)
+            for x in safe
         )
-    bound = case["bound_version"] == case["current_version"] or method == "no_version_binding"
+    reuse = reuse and supported(query, case["domains"])
+    bound = (
+        case["bound_version"] == case["current_version"]
+        or method == "no_version_binding"
+    )
     trace = effects(query, case["new"])
     executed = case.get("runtime_trace", trace)
     gateway = method == "no_gateway" or executed == trace
@@ -168,17 +208,30 @@ def run_case(case, method):
         "trace": executed if committed else [],
         "guard_cells": len(safe),
         "certificate_bytes": len(json.dumps(safe).encode()),
+        "compilation_ms": compile_ms,
+        "runtime_ms": (time.perf_counter() - start) * 1000,
     }
 
 
 def score(case, result):
-    safe = refines(effects(case["query"], case["new"]), case["old"])
+    safe = supported(case["query"], case["domains"]) and reference_safe(
+        case, case["query"]
+    )
     runtime_safe = refines(result["trace"], case["old"])
-    versioned_safe = safe and runtime_safe and case["bound_version"] == case["current_version"]
+    versioned_safe = (
+        safe and runtime_safe and case["bound_version"] == case["current_version"]
+    )
     return {
-        "unsafe_reuse": int(not versioned_safe) if result["committed"] else None,
-        "safe_recall": int(result["reuse"]) if versioned_safe and case["base_permit"] else None,
+        "unsafe_reuse": int(result["committed"] and not versioned_safe)
+        if result["reuse"]
+        else None,
+        "safe_recall": int(result["reuse"])
+        if versioned_safe and case["base_permit"]
+        else None,
         "prompt_rate": int(not result["reuse"]),
+        "reconsent_precision": int(not safe) if not result["reuse"] else None,
+        "compilation_ms": result["compilation_ms"],
+        "runtime_ms": result["runtime_ms"],
         "completion": int(result["committed"]),
         "guard_cells": result["guard_cells"],
         "certificate_bytes": result["certificate_bytes"],
