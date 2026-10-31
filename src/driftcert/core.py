@@ -1,10 +1,12 @@
-import copy
+"""Compiled consent preservation and the manuscript's matched mechanism baselines."""
+
 import itertools
-import json
 import time
 
+from . import compiler, schema
+from . import semantics as sem
 from .oracle import safe as reference_safe
-
+from .symbolic import Model
 
 METHODS = [
     "driftcert",
@@ -12,99 +14,64 @@ METHODS = [
     "schema",
     "global",
     "per_call",
+    "renew",
+    "uniform",
     "no_default_expansion",
     "no_version_binding",
+    "no_checker",
     "no_gateway",
 ]
+normalized = sem.normalized
 
 
-def normalized(raw, contract):
-    result = copy.deepcopy(contract.get("defaults", {}))
-    result.update(raw)
-    return result
+def effects(raw, contract, state=None):
+    branches = sem.traces(raw, contract, state)
+    if len(branches) != 1:
+        raise ValueError(
+            "Select an explicit execution branch for nondeterministic summaries"
+        )
+    return branches[0]
 
 
-def effects(raw, contract):
-    args = normalized(raw, contract)
-    trace = []
-    for effect in contract["effects"]:
-        if all(k in args and type(args[k]) is type(v) and args[k] == v
-               for k, v in effect.get("when", {}).items()):
-            value = {k: copy.deepcopy(v) for k, v in effect.items() if k != "when"}
-            for key, item in list(value.items()):
-                if isinstance(item, str) and item.startswith("$"):
-                    if item[1:] not in args:
-                        raise ValueError("Unresolved effect argument")
-                    value[key] = copy.deepcopy(args[item[1:]])
-            trace.append(value)
-    return trace
-
-
-def refines(trace, contract):
-    states = {0}
-    allowed = contract["allowed"]
-    for effect in trace:
-        following = set()
-        for start in states:
-            for position in range(start, len(allowed)):
-                if any(
-                    not allowed[j].get("optional", False)
-                    for j in range(start, position)
-                ):
-                    break
-                rule = allowed[position]
-                if (
-                    effect["action"] == rule["action"]
-                    and set(effect["objects"]) <= set(rule["objects"])
-                    and effect["recipient"] in rule["recipients"]
-                    and effect["label"] in rule["labels"]
-                ):
-                    following.add(position + 1)
-        states = following
-        if not states:
-            return False
-    return True
+def refines(trace, contract, case=None, args=None, raw=None, state=None):
+    return sem.refines(trace, contract, case, args, raw, state)
 
 
 def universe(domains):
     keys = sorted(domains)
-    for values in itertools.product(*(domains[k] for k in keys)):
-        yield {k: v for k, v in zip(keys, values) if v != "__MISSING__"}
-
-
-def compile_guard(case, method):
-    """Exhaustively certify the finite input domain, including presence/defaults."""
-    safe = []
-    old = case["old"]
-    for raw in universe(case["domains"]):
-        current = case["new"]
-        if method == "no_default_expansion":
-            current = {**current, "defaults": old.get("defaults", {})}
-        trace = effects(raw, current)
-        compatible = old_preconditions(case, raw)
-        if (
-            compatible
-            and refines(trace, old)
-            and (method == "no_default_expansion" or reference_safe(case, raw))
-        ):
-            safe.append(raw)
-    return safe
+    for values in itertools.product(*(domains[key] for key in keys)):
+        yield {
+            key: value
+            for key, value in zip(keys, values)
+            if not sem.equal(value, sem.MISSING)
+        }
 
 
 def supported(raw, domains):
-    return set(raw) <= set(domains) and any(
-        json.dumps(raw, sort_keys=True) == json.dumps(value, sort_keys=True)
-        for value in universe(domains)
+    return not set(raw) - set(domains) and all(
+        any(sem.equal(raw.get(name, sem.MISSING), value) for value in values)
+        for name, values in domains.items()
     )
 
 
-def old_preconditions(case, raw):
-    mapped = {case["mapping"].get(key, key): value for key, value in raw.items()}
-    values = normalized(mapped, case["old"])
-    return all(
-        key in values and type(values[key]) is type(value) and values[key] == value
-        for key, value in case["old"].get("requires", {}).items()
-    )
+def old_preconditions(case, raw, state=None):
+    mapped = sem.mapped(case, raw)
+    if mapped is None:
+        return False
+    args = sem.normalized(mapped, case["old"])
+    return sem.condition(
+        case["old"].get("requires", True), args, state, mapped
+    ) and all(name in args for name in case["old"].get("required_parameters", []))
+
+
+def compile_guard(case, method="driftcert"):
+    return compiler.compile_guard(case, method)
+
+
+def prepare(case, method):
+    if method in ("pin", "renew", "schema", "per_call"):
+        return None
+    return compile_guard(case, method)
 
 
 def generate(rng, count):
@@ -157,14 +124,57 @@ def generate(rng, count):
             "recipient": ["local", "remote"],
             "objects": [["public"], ["public", "private"]],
         }
+        families = [
+            "default_widening",
+            "recipient_widening",
+            "selector_widening",
+            "effect_addition",
+            "precondition_weakening",
+            "equivalent_refactor",
+        ]
+        family = families[index % len(families)]
+        mapping = {}
+        if family == "recipient_widening":
+            new["defaults"]["remote"] = False
+            old["allowed"][1]["objects"] = ["public", "private"]
+        elif family == "selector_widening":
+            new["defaults"]["remote"] = False
+            domains["recipient"] = ["local"]
+        elif family == "effect_addition":
+            domains["extra"] = [False, True, "__MISSING__"]
+            mapping["extra"] = "__DROP__"
+            new["defaults"]["extra"] = False
+            new["effects"].append(
+                dict(
+                    action="notify",
+                    objects=["public"],
+                    recipient="remote",
+                    label="public",
+                    when={"extra": True},
+                )
+            )
+        elif family == "precondition_weakening":
+            old["defaults"]["approved"] = True
+            old["requires"] = {"approved": True}
+            new["defaults"]["approved"] = False
+            domains["approved"] = [False, True, "__MISSING__"]
+        elif family == "equivalent_refactor":
+            new["defaults"]["remote"] = False
+            domains["remote"] = [False, "__MISSING__"]
+            domains["dest"] = domains.pop("recipient")
+            new["defaults"]["dest"] = new["defaults"].pop("recipient")
+            mapping["dest"] = "recipient"
+            for effect in new["effects"]:
+                if effect["recipient"] == "$recipient":
+                    effect["recipient"] = "$dest"
         query = rng.choice(list(universe(domains)))
         yield {
             "id": str(index),
-            "family": "default-recipient-scope",
+            "family": family,
             "old": old,
             "new": new,
             "domains": domains,
-            "mapping": {},
+            "mapping": mapping,
             "query": query,
             "bound_version": 1,
             "current_version": 2 if rng.random() < 0.15 else 1,
@@ -172,71 +182,170 @@ def generate(rng, count):
         }
 
 
-def run_case(case, method):
+def run_case(case, method, package=None):
+    case = sem.canonical_case(case)
+    if method not in METHODS:
+        raise ValueError(method)
+    needs = method not in ("pin", "renew", "schema", "per_call")
+    compiled_here = needs and package is None
+    if compiled_here:
+        package = prepare(case, method)
     start = time.perf_counter()
-    needs_compilation = method not in ("pin", "schema", "per_call")
-    safe = compile_guard(case, method) if needs_compilation else []
-    compile_ms = (time.perf_counter() - start) * 1000 if needs_compilation else 0.0
-    start = time.perf_counter()
-    query = case["query"]
+    raw, state = case["query"], case.get("query_state", case.get("state", {}))
+    domain_ok = supported(raw, case["domains"]) and sem.valid_new(case, raw, state)
+    domain_ok = domain_ok and all(
+        name in case.get("state_domains", {})
+        or name in state
+        and sem.equal(state[name], value)
+        for name, value in case.get("state", {}).items()
+    )
+    answer = None
     if method == "pin":
+        reuse = (
+            domain_ok
+            and "old_version" in case
+            and case["old_version"] == case.get("new_version")
+        )
+    elif method == "renew":
         reuse = False
     elif method == "schema":
-        reuse = True
-    elif method == "global":
-        reuse = len(safe) == len(list(universe(case["domains"])))
+        reuse = domain_ok and schema.compatible(case, raw)
     elif method == "per_call":
-        reuse = old_preconditions(case, query) and refines(
-            effects(query, case["new"]), case["old"]
+        model = Model(case)
+        point = {}
+        if domain_ok:
+            for name, values in model.domains.items():
+                actual = (
+                    state.get(name[7:], sem.MISSING)
+                    if name.startswith("@state.")
+                    else raw.get(name, sem.MISSING)
+                )
+                index = next(
+                    (
+                        index
+                        for index, value in enumerate(values)
+                        if sem.equal(value, actual)
+                    ),
+                    None,
+                )
+                if index is None:
+                    domain_ok = False
+                    break
+                point[name] = [index]
+        if not domain_ok:
+            point = None
+        answer = (
+            model.query(point, timeout_ms=case.get("solver_timeout_ms", 1000))
+            if point is not None
+            else {"status": "UNSUPPORTED"}
         )
+        reuse = domain_ok and answer["status"] == "UNSAT"
     else:
-        reuse = any(
-            json.dumps(query, sort_keys=True) == json.dumps(x, sort_keys=True)
-            for x in safe
-        )
-    reuse = reuse and supported(query, case["domains"])
-    bound = (
-        case["bound_version"] == case["current_version"]
-        or method == "no_version_binding"
+        reuse = domain_ok and compiler.accepts(package, raw, state)
+    bound = case.get("bound_version") == case.get("current_version")
+    bound = bound and all(
+        sem.equal(case.get("bound_" + key, value), case.get("current_" + key, value))
+        for key, value in case.get("bindings", {}).items()
     )
-    trace = effects(query, case["new"])
-    executed = case.get("runtime_trace", trace)
-    gateway = method == "no_gateway" or json.dumps(
-        executed, sort_keys=True, allow_nan=False
-    ) == json.dumps(trace, sort_keys=True, allow_nan=False)
-    committed = reuse and bound and case["base_permit"] and gateway
-    return {
-        "reuse": reuse and bound,
-        "committed": committed,
-        "trace": executed if committed else [],
-        "guard_cells": len(safe),
-        "certificate_bytes": len(json.dumps(safe).encode()),
-        "compilation_ms": compile_ms,
-        "runtime_ms": (time.perf_counter() - start) * 1000,
-    }
+    old_valid = (
+        case.get("approval_valid", True)
+        and not case.get("approval_revoked", False)
+        and case.get("now", 0) < case.get("approval_expires", float("inf"))
+    )
+    reuse = bool(reuse and old_valid and (bound or method == "no_version_binding"))
+    actual = case.get("current_new", case["new"])
+    candidates = sem.traces(raw, actual, state) if domain_ok else [[]]
+    trace = case.get("runtime_trace", candidates[case.get("branch", 0)])
+    analyzed = sem.traces(raw, case["new"], state) if domain_ok else [[]]
+    gateway = method == "no_gateway" or any(
+        len(trace) <= len(branch)
+        and all(sem.equal(a, b) for a, b in zip(trace, branch))
+        for branch in analyzed
+    )
+    renewed = False
+    fresh = case.get("fresh_approval")
+    if not reuse and fresh and fresh.get("approved") is True:
+        renewed = (
+            fresh.get("version") == case.get("current_version")
+            and fresh.get("principal") == case.get("principal", "fixture")
+            and case.get("now", 0) < fresh.get("expires", 0)
+            and not fresh.get("revoked", False)
+            and sem.refines(
+                trace, fresh["contract"], case, sem.normalized(raw, actual), raw, state
+            )
+        )
+    committed = bool(
+        domain_ok and case.get("base_permit", False) and gateway and (reuse or renewed)
+    )
+    return dict(
+        reuse=reuse,
+        renewed=renewed,
+        prompted=not reuse,
+        committed=committed,
+        trace=trace if committed else [],
+        binding_violation=bool(reuse and not bound),
+        guard_cells=len(package["cells"]) if package else 0,
+        certificate_bytes=len(sem.encode(package).encode()) if package else 0,
+        compilation_ms=package["compilation_ms"] if compiled_here else 0.0,
+        runtime_ms=(time.perf_counter() - start) * 1000,
+        solver_status=answer["status"] if answer else None,
+        unresolved_cells=len(package["unresolved"]) if package else 0,
+    )
 
 
 def score(case, result):
-    safe = supported(case["query"], case["domains"]) and reference_safe(
-        case, case["query"]
+    case = sem.canonical_case(case)
+    raw, state = case["query"], case.get("query_state", case.get("state", {}))
+    safe = supported(raw, case["domains"]) and reference_safe(case, raw, state)
+    mapped = sem.mapped(case, raw)
+    runtime_safe = (
+        old_preconditions(case, raw, state)
+        and mapped is not None
+        and sem.refines(
+            result["trace"],
+            case["old"],
+            case,
+            sem.normalized(mapped or {}, case["old"]),
+            mapped or {},
+            state,
+        )
     )
-    runtime_safe = refines(result["trace"], case["old"])
-    versioned_safe = (
-        safe and runtime_safe and case["bound_version"] == case["current_version"]
+    eligible = (
+        safe
+        and case.get("base_permit", False)
+        and case.get("approval_valid", True)
+        and not case.get("approval_revoked", False)
+        and case.get("now", 0) < case.get("approval_expires", float("inf"))
     )
-    return {
-        "unsafe_reuse": int(result["committed"] and not versioned_safe)
+    return dict(
+        unsafe_reuse=int(result["committed"] and not runtime_safe)
         if result["reuse"]
         else None,
-        "safe_recall": int(result["reuse"])
-        if versioned_safe and case["base_permit"]
-        else None,
-        "prompt_rate": int(not result["reuse"]),
-        "reconsent_precision": int(not safe) if not result["reuse"] else None,
-        "compilation_ms": result["compilation_ms"],
-        "runtime_ms": result["runtime_ms"],
-        "completion": int(result["committed"]),
-        "guard_cells": result["guard_cells"],
-        "certificate_bytes": result["certificate_bytes"],
-        "legal_effects": len(result["trace"]) if versioned_safe else 0,
+        safe_recall=int(result["reuse"]) if eligible else None,
+        prompt_rate=int(result["prompted"]),
+        reconsent_precision=int(not safe) if result["prompted"] else None,
+        compilation_ms=result["compilation_ms"],
+        runtime_ms=result["runtime_ms"],
+        completion=int(result["committed"]),
+        binding_violation=int(result["binding_violation"]),
+        guard_cells=result["guard_cells"],
+        certificate_bytes=result["certificate_bytes"],
+        unresolved_cells=result["unresolved_cells"],
+        legal_effects=len(result["trace"]) if runtime_safe or result["renewed"] else 0,
+    )
+
+
+def metric_counts(case, result):
+    return {
+        key: [value, 1] if value is not None else [0, 0]
+        for key, value in score(case, result).items()
+        if key
+        in (
+            "unsafe_reuse",
+            "safe_recall",
+            "prompt_rate",
+            "reconsent_precision",
+            "completion",
+            "binding_violation",
+        )
     }

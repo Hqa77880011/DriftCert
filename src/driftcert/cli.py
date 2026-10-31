@@ -1,9 +1,9 @@
 import argparse
 import csv
 import json
-import random
 import math
 import platform
+import random
 import sys
 import time
 from pathlib import Path
@@ -259,6 +259,42 @@ def main():
         help="Render selected metric PNGs; CSV retains all metrics",
     )
     item.add_argument("--output", required=True)
+    item = sub.add_parser("compile")
+    item.add_argument("--case", required=True)
+    item.add_argument("--method", choices=core.METHODS, default="driftcert")
+    item.add_argument("--output", required=True)
+    item = sub.add_parser("query")
+    item.add_argument("--package", required=True)
+    item.add_argument("--input", required=True)
+    item.add_argument("--representation", choices=["dnf", "bdd"], default="bdd")
+    for name in ("benchmark", "regions", "attack"):
+        item = sub.add_parser(name)
+        item.add_argument("--case", required=True)
+        item.add_argument("--method", choices=core.METHODS, default="driftcert")
+        item.add_argument("--output", required=True)
+        if name == "benchmark":
+            item.add_argument("--calls", type=int, default=100)
+            item.add_argument("--restarts", type=int, default=5)
+            item.add_argument("--warmup", type=float, default=30)
+            item.add_argument("--seconds", type=float, default=120)
+        if name == "attack":
+            item.add_argument(
+                "--visibility", choices=["black", "gray", "white"], default="black"
+            )
+            item.add_argument("--budget", type=int, default=100)
+            item.add_argument("--seed", type=int, default=17)
+    item = sub.add_parser("native")
+    item.add_argument(
+        "--config",
+        required=True,
+        help="Application-owned root/database/object/sink registry and key_file",
+    )
+    item.add_argument(
+        "--request",
+        required=True,
+        help="Explicit install/approve/revoke/advance_epoch/execute request",
+    )
+    item.add_argument("--output", required=True)
     args = parser.parse_args()
     if args.command == "prepare":
         if args.count < 1:
@@ -275,8 +311,84 @@ def main():
             execute(cases, method, Path(args.output) / method)
     elif args.command == "evaluate":
         evaluate(args.records, args.output)
-    else:
+    elif args.command == "plot":
         plot(args.inputs, args.output, args.metrics)
+    elif args.command == "query":
+        from .compiler import accepts
+
+        package = json.loads(Path(args.package).read_text(encoding="utf-8"))
+        request = json.loads(Path(args.input).read_text(encoding="utf-8"))
+        print(
+            json.dumps(
+                dict(
+                    accepted=accepts(
+                        package,
+                        request["raw"],
+                        request.get("state", {}),
+                        args.representation,
+                    )
+                )
+            )
+        )
+    else:
+        output = Path(args.output)
+        if output.exists():
+            raise FileExistsError(str(output))
+        if args.command == "native":
+            from .gateway import Gateway
+
+            config = json.loads(Path(args.config).read_text(encoding="utf-8"))
+            key = Path(config.pop("key_file")).read_bytes()
+            gateway = Gateway(key=key, **config)
+            request = json.loads(Path(args.request).read_text(encoding="utf-8"))
+            action = request.pop("action")
+            if action not in (
+                "install",
+                "approve",
+                "revoke",
+                "advance_epoch",
+                "execute",
+                "set_acl",
+                "set_state",
+            ):
+                raise ValueError("Unknown application operation")
+            value = getattr(gateway, action)(**request)
+        else:
+            case = json.loads(Path(args.case).read_text(encoding="utf-8"))
+            if args.command == "compile":
+                value = core.compile_guard(case, args.method)
+            else:
+                from . import evaluation
+
+                if args.command == "benchmark":
+                    if (
+                        args.calls < 1
+                        or args.restarts < 1
+                        or min(args.warmup, args.seconds) < 0
+                    ):
+                        raise ValueError("Invalid timing budget")
+                    value = evaluation.benchmark(
+                        case,
+                        args.method,
+                        args.calls,
+                        args.restarts,
+                        args.warmup,
+                        args.seconds,
+                    )
+                elif args.command == "regions":
+                    value = evaluation.exact_regions(case, args.method)
+                else:
+                    value = evaluation.attack(
+                        case,
+                        core.compile_guard(case, args.method),
+                        args.visibility,
+                        args.budget,
+                        args.seed,
+                    )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(
+            json.dumps(value, indent=2, allow_nan=False), encoding="utf-8"
+        )
 
 
 if __name__ == "__main__":
