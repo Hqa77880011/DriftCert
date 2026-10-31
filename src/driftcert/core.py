@@ -28,7 +28,8 @@ def effects(raw, contract):
     args = normalized(raw, contract)
     trace = []
     for effect in contract["effects"]:
-        if all(args.get(k) == v for k, v in effect.get("when", {}).items()):
+        if all(k in args and type(args[k]) is type(v) and args[k] == v
+               for k, v in effect.get("when", {}).items()):
             value = {k: copy.deepcopy(v) for k, v in effect.items() if k != "when"}
             for key, item in list(value.items()):
                 if isinstance(item, str) and item.startswith("$"):
@@ -200,7 +201,9 @@ def run_case(case, method):
     )
     trace = effects(query, case["new"])
     executed = case.get("runtime_trace", trace)
-    gateway = method == "no_gateway" or executed == trace
+    gateway = method == "no_gateway" or json.dumps(
+        executed, sort_keys=True, allow_nan=False
+    ) == json.dumps(trace, sort_keys=True, allow_nan=False)
     committed = reuse and bound and case["base_permit"] and gateway
     return {
         "reuse": reuse and bound,

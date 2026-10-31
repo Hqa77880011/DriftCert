@@ -83,6 +83,11 @@ Validated locally: editable installation, syntax/import and regression checks, s
 
 Regression checks cover hand-computable rates and eligible denominators, the algorithm's safety boundary, and applicable replay/serialization paths. The documented small-data preparation, execution, suite, evaluation, statistics and plotting commands are the validation entry points. No complete training or large experimental campaign is required for these checks.
 
+Guarded effects use the same typed presence semantics as the independent checker:
+missing differs from explicit null, and Boolean values differ from integers.
+Gateway summary agreement compares canonical JSON, preserving these distinctions
+inside nested effect records. Both boundaries have regression cases.
+
 Guard compilation exhaustively enumerates concrete finite inputs; it does not implement symbolic counterexample-prioritized cell partitioning or the paper Uniform/Renew interaction baselines. Runtime traces are supplied finite observations, not an OS-level network/filesystem effect gateway. Consent renewal, approval expiry and reviewed native version-pair corpora require application adapters. Agent inference/token cost is not generated or inferred. Family-level statistics and micro counts are kept distinct.
 
 The source retains its existing MIT license. Data and external systems remain subject to their own licenses and access rules.
